@@ -776,6 +776,98 @@ async function main() {
   })
 
   // ========================================================================
+  // Group Chats (E2E encrypted)
+  // ========================================================================
+
+  // Create a group chat
+  app.post('/api/groups', requireAuth, async (req, res) => {
+    try {
+      const { nameEncrypted, nameIv, members } = req.body
+      if (!nameEncrypted || !nameIv || !members || !Array.isArray(members) || members.length === 0)
+        return res.status(400).json({ error: 'nameEncrypted, nameIv, and members required' })
+      // Validate all members exist
+      for (const m of members) {
+        if (!m.username || !m.encryptedKey || !m.keyIv) return res.status(400).json({ error: 'Each member needs username, encryptedKey, keyIv' })
+      }
+      // Ensure creator is in members — auto-fix if client sent plaintext username
+      if (!members.find(m => m.username === req.user.username)) {
+        const creatorEntry = members.find(m => createHash('sha256').update(m.username).digest('hex') === req.user.username)
+        if (creatorEntry) creatorEntry.username = req.user.username
+        else return res.status(400).json({ error: 'Creator must be a member' })
+      }
+      const id = `g-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+      await userStore.createGroupChat(id, nameEncrypted, nameIv, req.user.username, members)
+      res.json({ id, ok: true })
+    } catch (err) { console.error('[group-create]', err); res.status(500).json({ error: 'Failed to create group' }) }
+  })
+
+  // List groups the user is in
+  app.get('/api/groups', requireAuth, async (req, res) => {
+    try {
+      const groups = await userStore.getGroupsForUser(req.user.username)
+      res.json({ groups: groups.map(g => ({ id: g.id, nameEncrypted: g.name_encrypted, nameIv: g.name_iv, creator: g.creator, encryptedKey: g.encrypted_key, keyIv: g.key_iv, createdAt: g.created_at, updatedAt: g.updated_at })) })
+    } catch (err) { res.status(500).json({ error: 'Failed' }) }
+  })
+
+  // Get group details + members
+  app.get('/api/groups/:id', requireAuth, async (req, res) => {
+    try {
+      if (!await userStore.isGroupMember(req.params.id, req.user.username)) return res.status(403).json({ error: 'Not a member' })
+      const group = await userStore.getGroupChat(req.params.id)
+      if (!group) return res.status(404).json({ error: 'Group not found' })
+      const members = await userStore.getGroupMembers(req.params.id)
+      const myKey = await userStore.getGroupMemberKey(req.params.id, req.user.username)
+      res.json({
+        id: group.id, nameEncrypted: group.name_encrypted, nameIv: group.name_iv, creator: group.creator,
+        encryptedKey: myKey?.encrypted_key, keyIv: myKey?.key_iv,
+        members: members.map(m => ({ username: m.username, addedAt: m.added_at })),
+        createdAt: group.created_at, updatedAt: group.updated_at,
+      })
+    } catch (err) { res.status(500).json({ error: 'Failed' }) }
+  })
+
+  // Add members to group (creator only)
+  app.post('/api/groups/:id/members', requireAuth, async (req, res) => {
+    try {
+      const group = await userStore.getGroupChat(req.params.id)
+      if (!group) return res.status(404).json({ error: 'Group not found' })
+      if (group.creator !== req.user.username) return res.status(403).json({ error: 'Only creator can add members' })
+      const { members } = req.body
+      if (!members || !Array.isArray(members)) return res.status(400).json({ error: 'members array required' })
+      await userStore.addGroupMembers(req.params.id, members)
+      res.json({ ok: true })
+    } catch (err) { res.status(500).json({ error: 'Failed' }) }
+  })
+
+  // Send message to group
+  app.post('/api/groups/:id/messages', requireAuth, async (req, res) => {
+    try {
+      if (!await userStore.isGroupMember(req.params.id, req.user.username)) return res.status(403).json({ error: 'Not a member' })
+      const { encryptedContent, iv } = req.body
+      if (!encryptedContent || !iv) return res.status(400).json({ error: 'encryptedContent and iv required' })
+      const id = `gm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+      await userStore.addGroupMessage(id, req.params.id, req.user.username, encryptedContent, iv)
+      res.json({ id, ok: true })
+    } catch (err) { console.error('[group-msg]', err); res.status(500).json({ error: 'Send failed' }) }
+  })
+
+  // Get group messages
+  app.get('/api/groups/:id/messages', requireAuth, async (req, res) => {
+    try {
+      if (!await userStore.isGroupMember(req.params.id, req.user.username)) return res.status(403).json({ error: 'Not a member' })
+      const before = parseInt(req.query.before) || Date.now()
+      const limit = Math.min(parseInt(req.query.limit) || 50, 100)
+      const messages = await userStore.getGroupMessages(req.params.id, before, limit)
+      res.json({
+        messages: messages.map(m => ({
+          id: m.id, groupId: m.group_id, from: m.from_user,
+          encryptedContent: m.encrypted_content, iv: m.iv, createdAt: m.created_at,
+        }))
+      })
+    } catch (err) { res.status(500).json({ error: 'Failed' }) }
+  })
+
+  // ========================================================================
   // Profile (public keys are public, everything else encrypted)
   // ========================================================================
 
