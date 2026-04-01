@@ -11,6 +11,34 @@ const T = {
 };
 
 // ============================================================================
+// Linkify — converts URLs in text to clickable links
+// ============================================================================
+const URL_RE = /(https?:\/\/[^\s<>"{}|\\^`[\]]+|www\.[^\s<>"{}|\\^`[\]]+)/gi;
+function Linkify({ text, color }) {
+  if (!text) return null;
+  const parts = [];
+  let last = 0;
+  for (const match of text.matchAll(URL_RE)) {
+    if (match.index > last) parts.push(text.slice(last, match.index));
+    let url = match[0];
+    const href = url.startsWith("www.") ? "https://" + url : url;
+    // Strip trailing punctuation that's likely not part of the URL
+    const trailingMatch = url.match(/[).,;:!?]+$/);
+    let trailing = "";
+    if (trailingMatch) { trailing = trailingMatch[0]; url = url.slice(0, -trailing.length); }
+    const cleanHref = url.startsWith("www.") ? "https://" + url : url;
+    parts.push(
+      <a key={match.index} href={cleanHref} target="_blank" rel="noopener noreferrer"
+        style={{ color: color || T.accent, textDecoration: "underline", wordBreak: "break-all" }}>{url}</a>
+    );
+    if (trailing) parts.push(trailing);
+    last = match.index + match[0].length;
+  }
+  if (last < text.length) parts.push(text.slice(last));
+  return parts.length > 0 ? parts : text;
+}
+
+// ============================================================================
 // Responsive hook
 // ============================================================================
 function useIsMobile(breakpoint = 768) {
@@ -1189,7 +1217,7 @@ function Post({ post, onDelete, isMobile }) {
               </div>
             </div>
           ) : (
-            content.text && <div style={{ color: T.text, lineHeight: 1.6, fontSize: 15, whiteSpace: "pre-wrap" }}>{content.text}</div>
+            content.text && <div style={{ color: T.text, lineHeight: 1.6, fontSize: 15, whiteSpace: "pre-wrap" }}><Linkify text={content.text} /></div>
           )}
           {decryptedPhotos.length > 0 && (
             <div style={{ display: "grid", gridTemplateColumns: decryptedPhotos.length === 1 ? "1fr" : (isMobile && decryptedPhotos.length >= 3) ? "1fr 1fr" : decryptedPhotos.length === 2 ? "1fr 1fr" : "1fr 1fr 1fr", gap: 4, marginTop: content.text ? 12 : 0, borderRadius: 12, overflow: "hidden" }}>
@@ -1274,7 +1302,7 @@ function Post({ post, onDelete, isMobile }) {
                     </div>
                   </div>
                 ) : (
-                  <div style={{ color: T.text, fontSize: 14, lineHeight: 1.5, marginTop: 2 }}>{c.text}</div>
+                  <div style={{ color: T.text, fontSize: 14, lineHeight: 1.5, marginTop: 2 }}><Linkify text={c.text} /></div>
                 )}
               </div>
             </div>
@@ -1373,7 +1401,7 @@ function Compose({ onPost, isMobile }) {
     <div style={{ background: T.bgCard, borderRadius: 12, padding: isMobile ? 12 : 16, border: `1px solid ${T.border}`, marginBottom: 16 }}>
       <div style={{ display: "flex", gap: isMobile ? 8 : 12 }}>
         {!isMobile && <Avatar username={currentUser} size={36} />}
-        <textarea value={text} onChange={e => setText(e.target.value)} placeholder="What's on your mind?" rows={3}
+        <textarea value={text} onChange={e => setText(e.target.value)} placeholder="" rows={3}
           style={{ flex: 1, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 8, padding: isMobile ? 10 : 12, color: T.text, fontSize: isMobile ? 14 : 15, resize: "vertical", fontFamily: "inherit", lineHeight: 1.5, outline: "none", minHeight: 60 }}
           onFocus={e => e.target.style.borderColor = T.borderFocus} onBlur={e => e.target.style.borderColor = T.border} />
       </div>
@@ -1509,8 +1537,8 @@ function FriendsView() {
         encryptedUsername,
       });
       await api.request("/api/friend-request", { method: "POST", body: JSON.stringify({ toHash: friendHash, toDomain: friendDomain, payload }) });
-    } catch (err) { console.error("[friend-request]", err); }
-    setSent(addr); setAddr("");
+      setSent(addr); setAddr("");
+    } catch (err) { console.error("[friend-request]", err); alert("Friend request failed: " + (err.message || "Unknown error")); }
   };
   const reFriend = async (friend) => {
     try {
@@ -1665,17 +1693,80 @@ async function deriveConversationKey(myEncPrivateKey, theirEncPubKeyB64) {
   return crypto.subtle.deriveKey({ name: "ECDH", public: theirPub }, myEncPrivateKey, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
 }
 
-async function encryptChatMessage(text, conversationKey) {
+async function encryptChatMessage(content, conversationKey) {
+  const payload = typeof content === "string" ? content : JSON.stringify(content);
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, conversationKey, enc.encode(text));
+  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, conversationKey, enc.encode(payload));
   return { encryptedContent: toB64(new Uint8Array(ct)), iv: toB64(iv) };
 }
 
 async function decryptChatMessage(encryptedContent, iv, conversationKey) {
   try {
     const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromB64(iv) }, conversationKey, fromB64(encryptedContent));
-    return dec.decode(plain);
+    const str = dec.decode(plain);
+    try { const parsed = JSON.parse(str); if (parsed && typeof parsed === "object" && ("text" in parsed || "photos" in parsed || "videos" in parsed)) return parsed; } catch {}
+    return { text: str };
   } catch { return null; }
+}
+
+// ============================================================================
+// Chat media decryption + display
+// ============================================================================
+function ChatMediaGrid({ refs, type, isMobile }) {
+  const [urls, setUrls] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const result = [];
+      for (const ref of refs) {
+        try {
+          const res = await fetch(`/content/${ref.hash}`);
+          if (!res.ok) { result.push(null); continue; }
+          const encrypted = new Uint8Array(await res.arrayBuffer());
+          const iv = encrypted.slice(0, 12);
+          const ct = encrypted.slice(12);
+          const key = await crypto.subtle.importKey("raw", fromB64(ref.key), { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+          const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, ct);
+          result.push(URL.createObjectURL(new Blob([plain], { type: ref.type || (type === "photo" ? "image/jpeg" : "video/mp4") })));
+        } catch { result.push(null); }
+      }
+      if (!cancelled) setUrls(result);
+    })();
+    return () => { cancelled = true; urls.forEach(u => { if (u) URL.revokeObjectURL(u); }); };
+  }, [refs]);
+  if (urls.length === 0) return null;
+  if (type === "video") return (<div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+    {urls.map((u, i) => u ? <video key={i} src={u} controls style={{ maxWidth: "100%", borderRadius: 12, maxHeight: 300 }} /> : null)}
+  </div>);
+  return (<div style={{ display: "flex", flexWrap: "wrap", gap: 2 }}>
+    {urls.map((u, i) => u ? <img key={i} src={u} alt="" style={{ maxWidth: urls.length === 1 ? "100%" : "calc(50% - 1px)", borderRadius: urls.length === 1 ? 12 : 4, maxHeight: 300, objectFit: "cover", cursor: "pointer" }} onClick={() => window.open(u, "_blank")} /> : null)}
+  </div>);
+}
+
+// ============================================================================
+// Group list item (decrypts group name)
+// ============================================================================
+function GroupListItem({ group, activeGroup, onOpen, decryptGroupKey, decryptGroupName }) {
+  const [name, setName] = useState("...");
+  useEffect(() => {
+    (async () => {
+      const gKey = await decryptGroupKey(group.encryptedKey, group.keyIv, group.creator);
+      if (gKey) { const n = await decryptGroupName(group.nameEncrypted, group.nameIv, gKey); setName(n); }
+      else setName("Group");
+    })();
+  }, [group.id]);
+  return (
+    <div onClick={() => onOpen(group)} style={{
+      padding: "10px 16px", cursor: "pointer", display: "flex", gap: 12, alignItems: "center",
+      background: activeGroup === group.id ? T.accentDim : "transparent",
+      borderLeft: activeGroup === group.id ? `3px solid ${T.accent}` : "3px solid transparent",
+    }}>
+      <div style={{ width: 32, height: 32, borderRadius: "50%", background: T.accent + "33", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: T.accent, fontWeight: 600 }}>G</div>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontWeight: 500, color: T.text, fontSize: 13 }}>{name}</div>
+      </div>
+    </div>
+  );
 }
 
 // ============================================================================
@@ -1692,13 +1783,54 @@ function DMView({ isMobile }) {
   const [convKey, setConvKey] = useState(null);
   const [newChatAddr, setNewChatAddr] = useState("");
   const [chatRequests, setChatRequests] = useState([]);
+  const [chatPhotos, setChatPhotos] = useState([]);
+  const [chatVideos, setChatVideos] = useState([]);
+  const [sendStatus, setSendStatus] = useState("");
+  // Group chat state
+  const [groups, setGroups] = useState([]);
+  const [activeGroup, setActiveGroup] = useState(null);
+  const [groupMessages, setGroupMessages] = useState([]);
+  const [groupKey, setGroupKey] = useState(null);
+  const [groupMembers, setGroupMembers] = useState([]);
+  const [groupName, setGroupName] = useState("");
+  const [showCreateGroup, setShowCreateGroup] = useState(false);
+  const [newGroupName, setNewGroupName] = useState("");
+  const [selectedFriends, setSelectedFriends] = useState([]);
+  const [groupChatPhotos, setGroupChatPhotos] = useState([]);
+  const [groupChatVideos, setGroupChatVideos] = useState([]);
+  const [groupSendStatus, setGroupSendStatus] = useState("");
   const endRef = useRef(null);
   const pollRef = useRef(null);
+  const chatMediaRef = useRef(null);
+  const groupMediaRef = useRef(null);
+  const groupEndRef = useRef(null);
+
+  const addChatMedia = (e) => {
+    const files = Array.from(e.target.files || []);
+    const newPhotos = files.filter(f => f.type.startsWith("image/")).slice(0, 10 - chatPhotos.length).map(file => ({ file, previewUrl: URL.createObjectURL(file) }));
+    const newVideos = files.filter(f => f.type.startsWith("video/")).slice(0, 5 - chatVideos.length).map(file => ({ file, previewUrl: URL.createObjectURL(file) }));
+    setChatPhotos(prev => [...prev, ...newPhotos].slice(0, 10));
+    setChatVideos(prev => [...prev, ...newVideos].slice(0, 5));
+    e.target.value = "";
+  };
+  const removeChatPhoto = (idx) => { setChatPhotos(prev => { URL.revokeObjectURL(prev[idx].previewUrl); return prev.filter((_, i) => i !== idx); }); };
+  const removeChatVideo = (idx) => { setChatVideos(prev => { URL.revokeObjectURL(prev[idx].previewUrl); return prev.filter((_, i) => i !== idx); }); };
+  const addGroupMedia = (e) => {
+    const files = Array.from(e.target.files || []);
+    const newPhotos = files.filter(f => f.type.startsWith("image/")).slice(0, 10 - groupChatPhotos.length).map(file => ({ file, previewUrl: URL.createObjectURL(file) }));
+    const newVideos = files.filter(f => f.type.startsWith("video/")).slice(0, 5 - groupChatVideos.length).map(file => ({ file, previewUrl: URL.createObjectURL(file) }));
+    setGroupChatPhotos(prev => [...prev, ...newPhotos].slice(0, 10));
+    setGroupChatVideos(prev => [...prev, ...newVideos].slice(0, 5));
+    e.target.value = "";
+  };
+  const removeGroupPhoto = (idx) => { setGroupChatPhotos(prev => { URL.revokeObjectURL(prev[idx].previewUrl); return prev.filter((_, i) => i !== idx); }); };
+  const removeGroupVideo = (idx) => { setGroupChatVideos(prev => { URL.revokeObjectURL(prev[idx].previewUrl); return prev.filter((_, i) => i !== idx); }); };
 
   useEffect(() => {
     const fetchData = async () => {
       try { const data = await api.request("/api/chats"); setConversations(data.conversations || []); } catch {}
       try { const data = await api.request("/api/notifications"); setChatRequests((data.notifications || []).filter(n => n.type === "chat_request")); } catch {}
+      try { const data = await api.request("/api/groups"); setGroups(data.groups || []); } catch {}
     };
     fetchData();
     const interval = setInterval(fetchData, 30000);
@@ -1706,6 +1838,7 @@ function DMView({ isMobile }) {
   }, []);
 
   useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages.length]);
+  useEffect(() => { groupEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [groupMessages.length]);
 
   const getDisplayName = (username) => {
     if (username === currentUser || username === identity?.usernameHash) return vault?.displayName || currentUser;
@@ -1731,6 +1864,7 @@ function DMView({ isMobile }) {
   };
 
   const openConversation = async (username) => {
+    setActiveGroup(null); setGroupKey(null); setGroupMessages([]);
     setActive(username);
     setMessages([]);
     setLoading(true);
@@ -1754,8 +1888,9 @@ function DMView({ isMobile }) {
       const { messages: raw } = await api.request(`/api/chats/${username}/messages`);
       const decrypted = [];
       for (const m of raw) {
-        const text = await decryptChatMessage(m.encryptedContent, m.iv, key);
-        decrypted.push({ ...m, text: text || "[Decryption failed]" });
+        const content = await decryptChatMessage(m.encryptedContent, m.iv, key);
+        if (!content) { decrypted.push({ ...m, text: "[Decryption failed]", photos: [], videos: [] }); }
+        else { decrypted.push({ ...m, text: content.text || "", photos: content.photos || [], videos: content.videos || [] }); }
       }
       setMessages(decrypted);
     } catch (err) { console.error("[chat]", err); }
@@ -1768,8 +1903,9 @@ function DMView({ isMobile }) {
         const { messages: raw } = await api.request(`/api/chats/${active}/messages`);
         const decrypted = [];
         for (const m of raw) {
-          const text = await decryptChatMessage(m.encryptedContent, m.iv, convKey);
-          decrypted.push({ ...m, text: text || "[Decryption failed]" });
+          const content = await decryptChatMessage(m.encryptedContent, m.iv, convKey);
+          if (!content) { decrypted.push({ ...m, text: "[Decryption failed]", photos: [], videos: [] }); }
+          else { decrypted.push({ ...m, text: content.text || "", photos: content.photos || [], videos: content.videos || [] }); }
         }
         setMessages(decrypted);
       } catch {}
@@ -1779,22 +1915,63 @@ function DMView({ isMobile }) {
   }, [active, convKey]);
 
   const sendMessage = async () => {
-    if (!newMsg.trim() || !active || !convKey) return;
+    if ((!newMsg.trim() && chatPhotos.length === 0 && chatVideos.length === 0) || !active || !convKey) return;
     setSending(true);
     try {
-      const { encryptedContent, iv } = await encryptChatMessage(newMsg.trim(), convKey);
+      const photoRefs = [];
+      for (let i = 0; i < chatPhotos.length; i++) {
+        setSendStatus(`Encrypting photo ${i + 1}/${chatPhotos.length}...`);
+        const raw = new Uint8Array(await chatPhotos[i].file.arrayBuffer());
+        const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, raw));
+        const combined = new Uint8Array(12 + ct.length); combined.set(iv); combined.set(ct, 12);
+        const hash = await computeHashClient(combined);
+        setSendStatus(`Uploading photo ${i + 1}/${chatPhotos.length}...`);
+        const formData = new FormData();
+        formData.append("file", new Blob([combined], { type: "application/octet-stream" }), `chat-photo-${i}.enc`);
+        const uploadRes = await fetch("/api/content/upload", { method: "POST", headers: { "Authorization": `Bearer ${api.token}` }, body: formData });
+        if (!uploadRes.ok) throw new Error("Photo upload failed");
+        const rawKey = await crypto.subtle.exportKey("raw", key);
+        photoRefs.push({ hash, key: toB64(new Uint8Array(rawKey)), iv: toB64(iv), type: chatPhotos[i].file.type || "image/jpeg" });
+      }
+      const videoRefs = [];
+      for (let i = 0; i < chatVideos.length; i++) {
+        setSendStatus(`Encrypting video ${i + 1}/${chatVideos.length}...`);
+        const raw = new Uint8Array(await chatVideos[i].file.arrayBuffer());
+        const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, raw));
+        const combined = new Uint8Array(12 + ct.length); combined.set(iv); combined.set(ct, 12);
+        const hash = await computeHashClient(combined);
+        setSendStatus(`Uploading video ${i + 1}/${chatVideos.length}...`);
+        const formData = new FormData();
+        formData.append("file", new Blob([combined], { type: "application/octet-stream" }), `chat-video-${i}.enc`);
+        const uploadRes = await fetch("/api/content/upload", { method: "POST", headers: { "Authorization": `Bearer ${api.token}` }, body: formData });
+        if (!uploadRes.ok) throw new Error("Video upload failed");
+        const rawKey = await crypto.subtle.exportKey("raw", key);
+        videoRefs.push({ hash, key: toB64(new Uint8Array(rawKey)), iv: toB64(iv), type: chatVideos[i].file.type || "video/mp4" });
+      }
+      setSendStatus("");
+      const content = { text: newMsg.trim() || null };
+      if (photoRefs.length > 0) content.photos = photoRefs;
+      if (videoRefs.length > 0) content.videos = videoRefs;
+      const { encryptedContent, iv: msgIv } = await encryptChatMessage(content, convKey);
       const res = await api.request(`/api/chats/${active}/messages`, {
         method: "POST",
-        body: JSON.stringify({ encryptedContent, iv }),
+        body: JSON.stringify({ encryptedContent, iv: msgIv }),
       });
-      setMessages(prev => [...prev, { id: res.id, from: currentUser, to: active, text: newMsg.trim(), createdAt: Date.now() }]);
+      setMessages(prev => [...prev, { id: res.id, from: currentUser, to: active, text: content.text || "", photos: photoRefs, videos: videoRefs, createdAt: Date.now() }]);
       setNewMsg("");
+      chatPhotos.forEach(p => URL.revokeObjectURL(p.previewUrl));
+      chatVideos.forEach(v => URL.revokeObjectURL(v.previewUrl));
+      setChatPhotos([]); setChatVideos([]);
       setConversations(prev => {
         const existing = prev.find(c => c.partner === active);
         if (existing) return [{ ...existing, lastMessageAt: Date.now(), lastMessageFrom: currentUser }, ...prev.filter(c => c.partner !== active)];
         return [{ partner: active, lastMessageAt: Date.now(), lastMessageFrom: currentUser }, ...prev];
       });
-    } catch (err) { console.error("[chat-send]", err); }
+    } catch (err) { console.error("[chat-send]", err); setSendStatus(""); }
     setSending(false);
   };
 
@@ -1802,7 +1979,8 @@ function DMView({ isMobile }) {
     const username = newChatAddr.split("@")[0];
     if (!username) return;
     try {
-      await api.request(`/api/chats/${username}/request`, { method: "POST" });
+      const userHash = await hashUsername(username);
+      await api.request(`/api/chats/${userHash}/request`, { method: "POST" });
       setNewChatAddr("");
       alert(`Chat request sent to ${username}`);
     } catch (err) { console.error("[chat-request]", err); alert(err.message); }
@@ -1828,6 +2006,175 @@ function DMView({ isMobile }) {
     setChatRequests(prev => prev.filter(r => r.id !== id));
   };
 
+  // ── Group chat functions ──
+
+  const decryptGroupKey = async (encryptedKeyB64, keyIvB64, creatorUsername) => {
+    if (!identity) return null;
+    // Try vault key first (creator's own key)
+    try {
+      const raw = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromB64(keyIvB64) }, identity.vaultKey, fromB64(encryptedKeyB64));
+      return crypto.subtle.importKey("raw", raw, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+    } catch {}
+    // Try ECDH with creator's public key (invited member)
+    if (creatorUsername) {
+      try {
+        let encPubKey = getEncPubKey(creatorUsername);
+        if (!encPubKey) {
+          const profile = await api.request(`/api/profile/${creatorUsername}`);
+          encPubKey = profile.encryptionPublicKey;
+        }
+        if (encPubKey) {
+          const sharedKey = await deriveConversationKey(identity.encryption.privateKey, encPubKey);
+          const raw = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromB64(keyIvB64) }, sharedKey, fromB64(encryptedKeyB64));
+          return crypto.subtle.importKey("raw", raw, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+        }
+      } catch {}
+    }
+    return null;
+  };
+
+  const decryptGroupName = async (nameEncrypted, nameIv, gKey) => {
+    try {
+      const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: fromB64(nameIv) }, gKey, fromB64(nameEncrypted));
+      return dec.decode(plain);
+    } catch { return "Group"; }
+  };
+
+  const openGroup = async (group) => {
+    setActive(null); setActiveGroup(group.id); setGroupMessages([]); setLoading(true);
+    const gKey = await decryptGroupKey(group.encryptedKey, group.keyIv, group.creator);
+    if (!gKey) { setLoading(false); return; }
+    setGroupKey(gKey);
+    const name = await decryptGroupName(group.nameEncrypted, group.nameIv, gKey);
+    setGroupName(name);
+    try {
+      const data = await api.request(`/api/groups/${group.id}`);
+      setGroupMembers(data.members || []);
+    } catch {}
+    try {
+      const { messages: raw } = await api.request(`/api/groups/${group.id}/messages`);
+      const decrypted = [];
+      for (const m of raw) {
+        const content = await decryptChatMessage(m.encryptedContent, m.iv, gKey);
+        if (!content) { decrypted.push({ ...m, text: "[Decryption failed]", photos: [], videos: [] }); }
+        else { decrypted.push({ ...m, text: content.text || "", photos: content.photos || [], videos: content.videos || [] }); }
+      }
+      setGroupMessages(decrypted);
+    } catch (err) { console.error("[group-load]", err); }
+    setLoading(false);
+  };
+
+  // Poll group messages
+  useEffect(() => {
+    if (!activeGroup || !groupKey) return;
+    const poll = async () => {
+      try {
+        const { messages: raw } = await api.request(`/api/groups/${activeGroup}/messages`);
+        const decrypted = [];
+        for (const m of raw) {
+          const content = await decryptChatMessage(m.encryptedContent, m.iv, groupKey);
+          if (!content) { decrypted.push({ ...m, text: "[Decryption failed]", photos: [], videos: [] }); }
+          else { decrypted.push({ ...m, text: content.text || "", photos: content.photos || [], videos: content.videos || [] }); }
+        }
+        setGroupMessages(decrypted);
+      } catch {}
+    };
+    const interval = setInterval(poll, 5000);
+    return () => clearInterval(interval);
+  }, [activeGroup, groupKey]);
+
+  const sendGroupMessage = async () => {
+    if ((!newMsg.trim() && groupChatPhotos.length === 0 && groupChatVideos.length === 0) || !activeGroup || !groupKey) return;
+    setSending(true);
+    try {
+      const photoRefs = [];
+      for (let i = 0; i < groupChatPhotos.length; i++) {
+        setGroupSendStatus(`Encrypting photo ${i + 1}/${groupChatPhotos.length}...`);
+        const raw = new Uint8Array(await groupChatPhotos[i].file.arrayBuffer());
+        const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, raw));
+        const combined = new Uint8Array(12 + ct.length); combined.set(iv); combined.set(ct, 12);
+        const hash = await computeHashClient(combined);
+        setGroupSendStatus(`Uploading photo ${i + 1}/${groupChatPhotos.length}...`);
+        const formData = new FormData();
+        formData.append("file", new Blob([combined], { type: "application/octet-stream" }), `gphoto-${i}.enc`);
+        const uploadRes = await fetch("/api/content/upload", { method: "POST", headers: { "Authorization": `Bearer ${api.token}` }, body: formData });
+        if (!uploadRes.ok) throw new Error("Photo upload failed");
+        const rawKey = await crypto.subtle.exportKey("raw", key);
+        photoRefs.push({ hash, key: toB64(new Uint8Array(rawKey)), iv: toB64(iv), type: groupChatPhotos[i].file.type || "image/jpeg" });
+      }
+      const videoRefs = [];
+      for (let i = 0; i < groupChatVideos.length; i++) {
+        setGroupSendStatus(`Encrypting video ${i + 1}/${groupChatVideos.length}...`);
+        const raw = new Uint8Array(await groupChatVideos[i].file.arrayBuffer());
+        const key = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, raw));
+        const combined = new Uint8Array(12 + ct.length); combined.set(iv); combined.set(ct, 12);
+        const hash = await computeHashClient(combined);
+        setGroupSendStatus(`Uploading video ${i + 1}/${groupChatVideos.length}...`);
+        const formData = new FormData();
+        formData.append("file", new Blob([combined], { type: "application/octet-stream" }), `gvideo-${i}.enc`);
+        const uploadRes = await fetch("/api/content/upload", { method: "POST", headers: { "Authorization": `Bearer ${api.token}` }, body: formData });
+        if (!uploadRes.ok) throw new Error("Video upload failed");
+        const rawKey = await crypto.subtle.exportKey("raw", key);
+        videoRefs.push({ hash, key: toB64(new Uint8Array(rawKey)), iv: toB64(iv), type: groupChatVideos[i].file.type || "video/mp4" });
+      }
+      setGroupSendStatus("");
+      const content = { text: newMsg.trim() || null };
+      if (photoRefs.length > 0) content.photos = photoRefs;
+      if (videoRefs.length > 0) content.videos = videoRefs;
+      const { encryptedContent, iv: msgIv } = await encryptChatMessage(content, groupKey);
+      const res = await api.request(`/api/groups/${activeGroup}/messages`, {
+        method: "POST", body: JSON.stringify({ encryptedContent, iv: msgIv }),
+      });
+      setGroupMessages(prev => [...prev, { id: res.id, from: currentUser, groupId: activeGroup, text: content.text || "", photos: photoRefs, videos: videoRefs, createdAt: Date.now() }]);
+      setNewMsg("");
+      groupChatPhotos.forEach(p => URL.revokeObjectURL(p.previewUrl));
+      groupChatVideos.forEach(v => URL.revokeObjectURL(v.previewUrl));
+      setGroupChatPhotos([]); setGroupChatVideos([]);
+    } catch (err) { console.error("[group-send]", err); setGroupSendStatus(""); }
+    setSending(false);
+  };
+
+  const createGroupChat = async () => {
+    if (!newGroupName.trim() || selectedFriends.length === 0 || !identity) return;
+    try {
+      // Generate random AES group key
+      const rawGroupKey = await crypto.subtle.generateKey({ name: "AES-GCM", length: 256 }, true, ["encrypt", "decrypt"]);
+      const rawKeyBytes = new Uint8Array(await crypto.subtle.exportKey("raw", rawGroupKey));
+      // Encrypt group name with group key
+      const nameIv = crypto.getRandomValues(new Uint8Array(12));
+      const nameCt = await crypto.subtle.encrypt({ name: "AES-GCM", iv: nameIv }, rawGroupKey, enc.encode(newGroupName.trim()));
+      // Encrypt group key for each member using their vault key (wrapped with our vault key for self, ECDH for others won't work since we don't have their private key)
+      // Approach: encrypt the raw group key with each member's encryption public key via ECDH
+      // For self: encrypt with our own vault key
+      const members = [];
+      // Self
+      const selfIv = crypto.getRandomValues(new Uint8Array(12));
+      const selfWrapped = await crypto.subtle.encrypt({ name: "AES-GCM", iv: selfIv }, identity.vaultKey, rawKeyBytes);
+      members.push({ username: currentUser, encryptedKey: toB64(new Uint8Array(selfWrapped)), keyIv: toB64(selfIv) });
+      // Other members — wrap with ECDH-derived key
+      for (const friend of selectedFriends) {
+        const encPubKey = getEncPubKey(friend.username);
+        if (!encPubKey) continue;
+        const sharedKey = await deriveConversationKey(identity.encryption.privateKey, encPubKey);
+        const memberIv = crypto.getRandomValues(new Uint8Array(12));
+        const wrapped = await crypto.subtle.encrypt({ name: "AES-GCM", iv: memberIv }, sharedKey, rawKeyBytes);
+        members.push({ username: friend.username, encryptedKey: toB64(new Uint8Array(wrapped)), keyIv: toB64(memberIv) });
+      }
+      const res = await api.request("/api/groups", {
+        method: "POST",
+        body: JSON.stringify({ nameEncrypted: toB64(new Uint8Array(nameCt)), nameIv: toB64(nameIv), members }),
+      });
+      // Refresh groups
+      const data = await api.request("/api/groups");
+      setGroups(data.groups || []);
+      setShowCreateGroup(false); setNewGroupName(""); setSelectedFriends([]);
+    } catch (err) { console.error("[group-create]", err); alert("Failed to create group: " + err.message); }
+  };
+
   const convPartners = new Set(conversations.map(c => c.partner));
   const friendsForChat = vault?.friends ? Object.entries(vault.friends)
     .filter(([addr, info]) => !info.expired && info.feedKeyB64)
@@ -1836,14 +2183,21 @@ function DMView({ isMobile }) {
   const contactsList = (vault?.chatContacts || [])
     .filter(c => !convPartners.has(c.username) && !isFriend(c.username));
 
-  const showConvList = !isMobile || !active;
-  const showChat = !isMobile || active;
+  const allFriends = vault?.friends ? Object.entries(vault.friends)
+    .filter(([, info]) => !info.expired && info.feedKeyB64)
+    .map(([addr]) => { const [username, domain] = addr.split("@"); return { username, domain }; }) : [];
+
+  const showConvList = !isMobile || (!active && !activeGroup);
+  const showChat = !isMobile || active || activeGroup;
 
   const convListPanel = (
     <div style={{ width: isMobile ? "100%" : 280, background: T.bgCard, overflowY: "auto", flexShrink: 0 }}>
       <div style={{ padding: 16, borderBottom: `1px solid ${T.border}` }}>
-        <h3 style={{ margin: 0, color: T.text, fontSize: 16 }}>Chats</h3>
-        <p style={{ margin: "4px 0 8px", color: T.textDim, fontSize: 12 }}>End-to-end encrypted</p>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+          <h3 style={{ margin: 0, color: T.text, fontSize: 16 }}>Chats</h3>
+          <button onClick={() => setShowCreateGroup(true)} style={{ background: "none", border: "none", color: T.accent, cursor: "pointer", fontSize: 12, fontWeight: 600, fontFamily: "inherit" }}>+ Group</button>
+        </div>
+        <p style={{ margin: "0 0 8px", color: T.textDim, fontSize: 12 }}>End-to-end encrypted</p>
         <div style={{ display: "flex", gap: 6 }}>
           <input value={newChatAddr} onChange={e => setNewChatAddr(e.target.value)} onKeyDown={e => e.key === "Enter" && sendChatRequest()} placeholder="username@lsocial.org"
             style={{ flex: 1, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 6, padding: "6px 10px", color: T.text, fontSize: 12, outline: "none", fontFamily: "inherit" }} />
@@ -1911,7 +2265,14 @@ function DMView({ isMobile }) {
         ))}
       </>)}
 
-      {conversations.length === 0 && friendsForChat.length === 0 && contactsList.length === 0 && chatRequests.length === 0 && (
+      {groups.length > 0 && (<>
+        <div style={{ padding: "10px 16px 6px", color: T.textDim, fontSize: 11, textTransform: "uppercase", letterSpacing: 1, borderTop: `1px solid ${T.border}` }}>Groups</div>
+        {groups.map(g => (
+          <GroupListItem key={g.id} group={g} activeGroup={activeGroup} onOpen={openGroup} decryptGroupKey={decryptGroupKey} decryptGroupName={decryptGroupName} />
+        ))}
+      </>)}
+
+      {conversations.length === 0 && friendsForChat.length === 0 && contactsList.length === 0 && chatRequests.length === 0 && groups.length === 0 && (
         <div style={{ padding: 20, color: T.textDim, fontSize: 13, textAlign: "center" }}>Add friends or send a chat request to start</div>
       )}
     </div>
@@ -1936,11 +2297,15 @@ function DMView({ isMobile }) {
               <div style={{
                 background: m.from === currentUser ? T.accent : T.bgCard,
                 color: m.from === currentUser ? "#fff" : T.text,
-                padding: "10px 14px", borderRadius: 16,
+                padding: (m.photos?.length || m.videos?.length) ? 4 : "10px 14px", borderRadius: 16,
                 borderBottomRightRadius: m.from === currentUser ? 4 : 16,
                 borderBottomLeftRadius: m.from !== currentUser ? 4 : 16,
-                fontSize: 14, lineHeight: 1.5,
-              }}>{m.text}</div>
+                fontSize: 14, lineHeight: 1.5, overflow: "hidden",
+              }}>
+                {m.photos?.length > 0 && <ChatMediaGrid refs={m.photos} type="photo" isMobile={isMobile} />}
+                {m.videos?.length > 0 && <ChatMediaGrid refs={m.videos} type="video" isMobile={isMobile} />}
+                {m.text && <div style={{ padding: (m.photos?.length || m.videos?.length) ? "6px 10px 8px" : 0 }}><Linkify text={m.text} color={m.from === currentUser ? "#fff" : undefined} /></div>}
+              </div>
               <div style={{ fontSize: 11, color: T.textDim, marginTop: 4, textAlign: m.from === currentUser ? "right" : "left" }}>
                 <TimeAgo ts={m.createdAt} />
               </div>
@@ -1948,38 +2313,166 @@ function DMView({ isMobile }) {
           ))}
           <div ref={endRef} />
         </div>
-        <div style={{ padding: isMobile ? 10 : 16, borderTop: `1px solid ${T.border}`, display: "flex", gap: 8, background: T.bgCard }}>
-          <input value={newMsg} onChange={e => setNewMsg(e.target.value)}
-            onKeyDown={e => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), sendMessage())}
-            placeholder="Type a message..."
-            style={{ flex: 1, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 24, padding: "10px 16px", color: T.text, fontSize: 14, outline: "none", fontFamily: "inherit" }} />
-          <Btn onClick={sendMessage} disabled={!newMsg.trim() || sending} small style={{ borderRadius: 24 }}>
-            {sending ? "..." : "Send"}
-          </Btn>
+        <div style={{ borderTop: `1px solid ${T.border}`, background: T.bgCard }}>
+          {(chatPhotos.length > 0 || chatVideos.length > 0) && (
+            <div style={{ display: "flex", gap: 6, padding: "8px 12px 0", flexWrap: "wrap" }}>
+              {chatPhotos.map((p, i) => (
+                <div key={`p${i}`} style={{ position: "relative", width: 56, height: 56, borderRadius: 8, overflow: "hidden" }}>
+                  <img src={p.previewUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                  <button onClick={() => removeChatPhoto(i)} style={{ position: "absolute", top: 1, right: 1, width: 18, height: 18, borderRadius: "50%", background: "rgba(0,0,0,0.7)", border: "none", color: "#fff", fontSize: 10, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
+                </div>
+              ))}
+              {chatVideos.map((v, i) => (
+                <div key={`v${i}`} style={{ position: "relative", width: 72, height: 56, borderRadius: 8, overflow: "hidden", background: T.bgHover }}>
+                  <video src={v.previewUrl} style={{ width: "100%", height: "100%", objectFit: "cover" }} muted />
+                  <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", color: "#fff", fontSize: 18 }}>▶</div>
+                  <button onClick={() => removeChatVideo(i)} style={{ position: "absolute", top: 1, right: 1, width: 18, height: 18, borderRadius: "50%", background: "rgba(0,0,0,0.7)", border: "none", color: "#fff", fontSize: 10, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
+                </div>
+              ))}
+            </div>
+          )}
+          {sendStatus && <div style={{ padding: "4px 12px", fontSize: 11, color: T.accent }}>{sendStatus}</div>}
+          <div style={{ padding: isMobile ? 10 : 12, display: "flex", gap: 8, alignItems: "center" }}>
+            <button onClick={() => chatMediaRef.current?.click()} style={{ background: "none", border: "none", color: T.textMuted, cursor: "pointer", fontSize: 18, padding: 4 }} title="Attach photos or videos">📎</button>
+            <input ref={chatMediaRef} type="file" accept="image/*,video/*" multiple onChange={addChatMedia} style={{ display: "none" }} />
+            <input value={newMsg} onChange={e => setNewMsg(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), sendMessage())}
+              placeholder="Type a message..."
+              style={{ flex: 1, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 24, padding: "10px 16px", color: T.text, fontSize: 14, outline: "none", fontFamily: "inherit" }} />
+            <Btn onClick={sendMessage} disabled={(!newMsg.trim() && chatPhotos.length === 0 && chatVideos.length === 0) || sending} small style={{ borderRadius: 24 }}>
+              {sending ? "..." : "Send"}
+            </Btn>
+          </div>
         </div>
-      </>) : (
+      </>) : !activeGroup ? (
         <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", color: T.textDim, fontSize: 14 }}>
           Select a conversation or start a new chat
         </div>
-      )}
+      ) : null}
     </div>
   );
 
+  const groupChatPanel = (
+    <div style={{ flex: 1, background: T.bg, display: "flex", flexDirection: "column", minHeight: isMobile ? "calc(100vh - 200px)" : undefined }}>
+      <div style={{ padding: "12px 16px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", gap: 12, background: T.bgCard }}>
+        {isMobile && <button onClick={() => setActiveGroup(null)} style={{ background: "none", border: "none", color: T.accent, cursor: "pointer", fontSize: 18, padding: "2px 6px 2px 0" }}>←</button>}
+        <div style={{ width: 32, height: 32, borderRadius: "50%", background: T.accent + "33", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 14, color: T.accent, fontWeight: 600 }}>G</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontWeight: 600, color: T.text, fontSize: 14 }}>{groupName}</div>
+          <div style={{ color: T.textDim, fontSize: 11 }}>{groupMembers.length} members · 🔒 E2E</div>
+        </div>
+      </div>
+      <div style={{ flex: 1, overflowY: "auto", padding: isMobile ? 12 : 20, display: "flex", flexDirection: "column", gap: 8 }}>
+        {loading && <div style={{ color: T.textDim, fontSize: 13, textAlign: "center", padding: 20 }}>Loading messages...</div>}
+        {!loading && groupMessages.length === 0 && <div style={{ color: T.textDim, fontSize: 13, textAlign: "center", padding: 20 }}>No messages yet. Say something!</div>}
+        {groupMessages.map(m => (
+          <div key={m.id} style={{ alignSelf: m.from === currentUser ? "flex-end" : "flex-start", maxWidth: isMobile ? "85%" : "70%" }}>
+            {m.from !== currentUser && <div style={{ fontSize: 11, color: T.accent, marginBottom: 2, fontWeight: 600 }}>{getDisplayName(m.from)}</div>}
+            <div style={{
+              background: m.from === currentUser ? T.accent : T.bgCard,
+              color: m.from === currentUser ? "#fff" : T.text,
+              padding: (m.photos?.length || m.videos?.length) ? 4 : "10px 14px", borderRadius: 16,
+              borderBottomRightRadius: m.from === currentUser ? 4 : 16,
+              borderBottomLeftRadius: m.from !== currentUser ? 4 : 16,
+              fontSize: 14, lineHeight: 1.5, overflow: "hidden",
+            }}>
+              {m.photos?.length > 0 && <ChatMediaGrid refs={m.photos} type="photo" isMobile={isMobile} />}
+              {m.videos?.length > 0 && <ChatMediaGrid refs={m.videos} type="video" isMobile={isMobile} />}
+              {m.text && <div style={{ padding: (m.photos?.length || m.videos?.length) ? "6px 10px 8px" : 0 }}><Linkify text={m.text} color={m.from === currentUser ? "#fff" : undefined} /></div>}
+            </div>
+            <div style={{ fontSize: 11, color: T.textDim, marginTop: 4, textAlign: m.from === currentUser ? "right" : "left" }}>
+              <TimeAgo ts={m.createdAt} />
+            </div>
+          </div>
+        ))}
+        <div ref={groupEndRef} />
+      </div>
+      <div style={{ borderTop: `1px solid ${T.border}`, background: T.bgCard }}>
+        {(groupChatPhotos.length > 0 || groupChatVideos.length > 0) && (
+          <div style={{ display: "flex", gap: 6, padding: "8px 12px 0", flexWrap: "wrap" }}>
+            {groupChatPhotos.map((p, i) => (
+              <div key={`p${i}`} style={{ position: "relative", width: 56, height: 56, borderRadius: 8, overflow: "hidden" }}>
+                <img src={p.previewUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                <button onClick={() => removeGroupPhoto(i)} style={{ position: "absolute", top: 1, right: 1, width: 18, height: 18, borderRadius: "50%", background: "rgba(0,0,0,0.7)", border: "none", color: "#fff", fontSize: 10, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
+              </div>
+            ))}
+            {groupChatVideos.map((v, i) => (
+              <div key={`v${i}`} style={{ position: "relative", width: 72, height: 56, borderRadius: 8, overflow: "hidden", background: T.bgHover }}>
+                <video src={v.previewUrl} style={{ width: "100%", height: "100%", objectFit: "cover" }} muted />
+                <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", color: "#fff", fontSize: 18 }}>▶</div>
+                <button onClick={() => removeGroupVideo(i)} style={{ position: "absolute", top: 1, right: 1, width: 18, height: 18, borderRadius: "50%", background: "rgba(0,0,0,0.7)", border: "none", color: "#fff", fontSize: 10, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>✕</button>
+              </div>
+            ))}
+          </div>
+        )}
+        {groupSendStatus && <div style={{ padding: "4px 12px", fontSize: 11, color: T.accent }}>{groupSendStatus}</div>}
+        <div style={{ padding: isMobile ? 10 : 12, display: "flex", gap: 8, alignItems: "center" }}>
+          <button onClick={() => groupMediaRef.current?.click()} style={{ background: "none", border: "none", color: T.textMuted, cursor: "pointer", fontSize: 18, padding: 4 }} title="Attach photos or videos">📎</button>
+          <input ref={groupMediaRef} type="file" accept="image/*,video/*" multiple onChange={addGroupMedia} style={{ display: "none" }} />
+          <input value={newMsg} onChange={e => setNewMsg(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && !e.shiftKey && (e.preventDefault(), sendGroupMessage())}
+            placeholder="Type a message..."
+            style={{ flex: 1, background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 24, padding: "10px 16px", color: T.text, fontSize: 14, outline: "none", fontFamily: "inherit" }} />
+          <Btn onClick={sendGroupMessage} disabled={(!newMsg.trim() && groupChatPhotos.length === 0 && groupChatVideos.length === 0) || sending} small style={{ borderRadius: 24 }}>
+            {sending ? "..." : "Send"}
+          </Btn>
+        </div>
+      </div>
+    </div>
+  );
+
+  const createGroupModal = showCreateGroup ? (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000, padding: 20 }} onClick={() => setShowCreateGroup(false)}>
+      <div onClick={e => e.stopPropagation()} style={{ background: T.bgCard, borderRadius: 16, padding: 24, maxWidth: 400, width: "100%", maxHeight: "80vh", overflowY: "auto", border: `1px solid ${T.border}` }}>
+        <h3 style={{ margin: "0 0 16px", color: T.text, fontSize: 18 }}>New Group Chat</h3>
+        <input value={newGroupName} onChange={e => setNewGroupName(e.target.value)} placeholder="Group name"
+          style={{ width: "100%", background: T.bgInput, border: `1px solid ${T.border}`, borderRadius: 8, padding: "10px 12px", color: T.text, fontSize: 14, outline: "none", fontFamily: "inherit", marginBottom: 16, boxSizing: "border-box" }} />
+        <div style={{ color: T.textDim, fontSize: 12, marginBottom: 8, textTransform: "uppercase", letterSpacing: 1 }}>Select friends to invite</div>
+        <div style={{ maxHeight: 250, overflowY: "auto", marginBottom: 16 }}>
+          {allFriends.map(f => {
+            const selected = selectedFriends.some(s => s.username === f.username);
+            return (
+              <div key={f.username} onClick={() => {
+                if (selected) setSelectedFriends(prev => prev.filter(s => s.username !== f.username));
+                else setSelectedFriends(prev => [...prev, f]);
+              }} style={{ padding: "10px 12px", display: "flex", gap: 10, alignItems: "center", cursor: "pointer", borderRadius: 8, background: selected ? T.accentDim : "transparent", marginBottom: 2 }}>
+                <Avatar username={f.username} size={28} domain={f.domain} />
+                <div style={{ flex: 1, color: T.text, fontSize: 13 }}>{getDisplayName(f.username)}</div>
+                <div style={{ width: 20, height: 20, borderRadius: 4, border: `2px solid ${selected ? T.accent : T.border}`, background: selected ? T.accent : "transparent", display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 12 }}>
+                  {selected && "✓"}
+                </div>
+              </div>
+            );
+          })}
+          {allFriends.length === 0 && <div style={{ color: T.textDim, fontSize: 13, textAlign: "center", padding: 20 }}>Add friends first to create a group</div>}
+        </div>
+        {selectedFriends.length > 0 && <div style={{ color: T.textDim, fontSize: 12, marginBottom: 12 }}>{selectedFriends.length} friend{selectedFriends.length !== 1 ? "s" : ""} selected</div>}
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <Btn small onClick={() => { setShowCreateGroup(false); setNewGroupName(""); setSelectedFriends([]); }} style={{ background: T.bgHover, color: T.text }}>Cancel</Btn>
+          <Btn small onClick={createGroupChat} disabled={!newGroupName.trim() || selectedFriends.length === 0}>Create Group</Btn>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   if (isMobile) {
-    return (
+    return (<>
+      {createGroupModal}
       <div style={{ background: T.border, borderRadius: 12, overflow: "hidden", border: `1px solid ${T.border}` }}>
         {showConvList && convListPanel}
         {showChat && active && chatPanel}
+        {showChat && activeGroup && groupChatPanel}
       </div>
-    );
+    </>);
   }
 
-  return (
+  return (<>
+    {createGroupModal}
     <div style={{ display: "flex", height: "calc(100vh - 120px)", gap: 1, background: T.border, borderRadius: 12, overflow: "hidden", border: `1px solid ${T.border}` }}>
       {convListPanel}
-      {chatPanel}
+      {active ? chatPanel : activeGroup ? groupChatPanel : chatPanel}
     </div>
-  );
+  </>);
 }
 
 // ============================================================================
