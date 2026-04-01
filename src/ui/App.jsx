@@ -408,6 +408,24 @@ function PasswordStrengthMeter({ password }) {
 const avatarCache = new Map();
 const avatarLoading = new Set();
 
+async function reEncryptContent(hash, oldFeedKey, newFeedKey) {
+  const res = await fetch(`/content/${hash}`);
+  if (!res.ok) return null;
+  const encrypted = new Uint8Array(await res.arrayBuffer());
+  const iv = encrypted.slice(0, 12); const ct = encrypted.slice(12);
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, oldFeedKey, ct);
+  const newIv = crypto.getRandomValues(new Uint8Array(12));
+  const newCt = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: newIv }, newFeedKey, plain));
+  const combined = new Uint8Array(newIv.length + newCt.length);
+  combined.set(newIv); combined.set(newCt, 12);
+  const form = new FormData();
+  form.append("file", new Blob([combined], { type: "application/octet-stream" }), "re-encrypted.enc");
+  const uploadRes = await fetch("/api/content/upload", { method: "POST", headers: { "Authorization": `Bearer ${api.token}` }, body: form });
+  if (!uploadRes.ok) return null;
+  const data = await uploadRes.json();
+  return data.hash;
+}
+
 async function loadAvatar(username, domain) {
   const addr = `${username}@${domain}`;
   if (avatarCache.has(addr) || avatarLoading.has(addr)) return avatarCache.get(addr) || null;
@@ -629,7 +647,9 @@ async function saveVault() {
 }
 
 async function processKeyExchanges() {
-  if (!identity) return;
+  if (!identity) return false;
+  await buildVaultHashCache();
+  let updated = false;
   try {
     const { exchanges } = await api.request("/api/key-exchange");
     for (const ex of exchanges) {
@@ -651,6 +671,11 @@ async function processKeyExchanges() {
         if (result) {
           if (!vault.friends[addr]) vault.friends[addr] = {};
           if (existing?.feedKeyB64 && existing.feedKeyB64 !== result.feedKeyB64) {
+            // Store ALL previous keys, not just one
+            if (!vault.friends[addr].previousFeedKeys) vault.friends[addr].previousFeedKeys = [];
+            if (!vault.friends[addr].previousFeedKeys.includes(existing.feedKeyB64)) {
+              vault.friends[addr].previousFeedKeys.push(existing.feedKeyB64);
+            }
             vault.friends[addr].previousFeedKeyB64 = existing.feedKeyB64;
             vault.friends[addr].keyChangedAt = Date.now();
           }
@@ -661,9 +686,23 @@ async function processKeyExchanges() {
           if (result.photoHash) vault.friends[addr].photoHash = result.photoHash;
           if (result.fullPhotoHash) vault.friends[addr].fullPhotoHash = result.fullPhotoHash;
           if (result.username) vault.friends[addr].plaintextUsername = result.username;
+          // Also update any plaintext-keyed entry for the same friend
+          const fromHash = addr.split("@")[0];
+          if (/^[a-f0-9]{64}$/.test(fromHash) && vaultHashCache.has(fromHash)) {
+            const ptAddr = vaultHashCache.get(fromHash);
+            if (ptAddr !== addr && vault.friends[ptAddr]) {
+              vault.friends[ptAddr].feedKeyB64 = result.feedKeyB64;
+              vault.friends[ptAddr].encPubKey = profile.encryptionPublicKey;
+              if (result.displayName) vault.friends[ptAddr].displayName = result.displayName;
+              if (result.photoHash) vault.friends[ptAddr].photoHash = result.photoHash;
+              if (result.fullPhotoHash) vault.friends[ptAddr].fullPhotoHash = result.fullPhotoHash;
+            }
+          }
           await saveVault();
+          updated = true;
+          // Only delete exchange after successful processing
+          await api.request(`/api/key-exchange/${ex.id}`, { method: "DELETE" });
         }
-        await api.request(`/api/key-exchange/${ex.id}`, { method: "DELETE" });
       } catch (err) { console.warn("[key-exchange] Processing failed:", err); }
     }
   } catch {}
@@ -677,6 +716,45 @@ async function processKeyExchanges() {
     }
     if (changed) await saveVault();
   }
+  return updated;
+}
+
+async function retryPendingKeyRotations() {
+  if (!identity || !vault || !vault.pendingKeyRotations?.length) return;
+  const remaining = [];
+  const sentToHashes = new Set();
+  for (const entry of vault.pendingKeyRotations) {
+    const addr = entry.addr;
+    // Drop entries older than 30 days
+    if (Date.now() - entry.createdAt > 30 * 24 * 60 * 60 * 1000) continue;
+    const friendInfo = vault.friends[addr];
+    if (!friendInfo) continue;
+    const friendUser = addr.split("@")[0];
+    const friendHash = /^[a-f0-9]{64}$/.test(friendUser) ? friendUser : await hashUsername(friendUser);
+    if (sentToHashes.has(friendHash)) continue;
+    let encPubKey = friendInfo.encPubKey;
+    if (!encPubKey) {
+      try {
+        const profile = await api.request(`/api/profile/${friendHash}`);
+        if (profile.encryptionPublicKey) {
+          encPubKey = profile.encryptionPublicKey;
+          vault.friends[addr].encPubKey = encPubKey;
+        }
+      } catch {}
+    }
+    if (!encPubKey) { remaining.push(entry); continue; }
+    try {
+      const keyPayload = await encryptFeedKeyForFriend(identity.feedKeyB64, identity.encryption.privateKey, encPubKey, vault.displayName || null, vault.photoHash || null, vault.fullPhotoHash || null, window._currentUser);
+      await api.request("/api/key-exchange", { method: "POST", body: JSON.stringify({ toUsername: friendHash, encryptedPayload: keyPayload }) });
+      sentToHashes.add(friendHash);
+    } catch { remaining.push(entry); }
+  }
+  if (remaining.length > 0) {
+    vault.pendingKeyRotations = remaining;
+  } else {
+    delete vault.pendingKeyRotations;
+  }
+  await saveVault();
 }
 
 async function processFriendAccepted() {
@@ -822,7 +900,7 @@ function Btn({ children, variant = "primary", onClick, disabled, small, style = 
 // Post
 // ============================================================================
 function Post({ post, onDelete, isMobile }) {
-  const { currentUser, navigateToProfile } = useApp();
+  const { currentUser, navigateToProfile, vaultVersion } = useApp();
   const [content, setContent] = useState(null);
   const [failed, setFailed] = useState(false);
   const [authorFeedKey, setAuthorFeedKey] = useState(null);
@@ -851,6 +929,8 @@ function Post({ post, onDelete, isMobile }) {
 
   useEffect(() => {
     if (!post.envelope) { setFailed(true); return; }
+    if (content && !failed) return; // Already decrypted successfully
+    setFailed(false);
     (async () => {
       try {
         const env = typeof post.envelope === "string" ? JSON.parse(post.envelope) : post.envelope;
@@ -880,9 +960,21 @@ function Post({ post, onDelete, isMobile }) {
             if (decrypted) fk = importedKey;
           }
           if (!decrypted && friendInfo?.previousFeedKeyB64) {
-            const prevKey = await importFeedKeyFromB64(friendInfo.previousFeedKeyB64);
-            decrypted = await decryptWithFeedKey(env.ct, env.iv, prevKey);
-            if (decrypted) fk = prevKey;
+            try {
+              const prevKey = await importFeedKeyFromB64(friendInfo.previousFeedKeyB64);
+              decrypted = await decryptWithFeedKey(env.ct, env.iv, prevKey);
+              if (decrypted) fk = prevKey;
+            } catch {}
+          }
+          // Try all stored previous keys for this friend
+          if (!decrypted && friendInfo?.previousFeedKeys) {
+            for (const prevB64 of friendInfo.previousFeedKeys) {
+              try {
+                const prevKey = await importFeedKeyFromB64(prevB64);
+                decrypted = await decryptWithFeedKey(env.ct, env.iv, prevKey);
+                if (decrypted) { fk = prevKey; break; }
+              } catch {}
+            }
           }
         }
         if (decrypted) {
@@ -923,7 +1015,7 @@ function Post({ post, onDelete, isMobile }) {
       } catch { setFailed(true); }
     })();
     return () => { decryptedPhotos.forEach(u => { if (u) URL.revokeObjectURL(u); }); decryptedVideos.forEach(v => { if (v?.url) URL.revokeObjectURL(v.url); }); };
-  }, [post]);
+  }, [post, vaultVersion]);
 
   const getDisplayName = (username, domain, authorHash) => {
     if (username === currentUser || username === identity?.usernameHash) return vault?.displayName || currentUser;
@@ -1366,7 +1458,7 @@ function FriendsView() {
       try { const data = await api.request("/api/notifications"); setPendingRequests((data.notifications || []).filter(n => n.type === "friend_request")); } catch {}
       // Fetch hash-based friend requests
       try { const data = await api.request("/api/friend-requests"); setHashRequests(data.requests || []); } catch {}
-      await processKeyExchanges(); await processFriendAccepted();
+      await processKeyExchanges(); await processFriendAccepted(); await retryPendingKeyRotations();
     };
     fetchData(); const interval = setInterval(fetchData, 30000); return () => clearInterval(interval);
   }, []);
@@ -1917,8 +2009,10 @@ function ProfileView({ isMobile }) {
       for (const addr of Object.keys(vault.friends || {})) {
         const friendInfo = vault.friends[addr]; if (!friendInfo?.encPubKey) continue;
         try {
+          const friendUser = addr.split("@")[0];
+          const toUsername = /^[a-f0-9]{64}$/.test(friendUser) ? friendUser : await hashUsername(friendUser);
           const keyPayload = await encryptFeedKeyForFriend(identity.feedKeyB64, identity.encryption.privateKey, friendInfo.encPubKey, vault.displayName || null, vault.photoHash, vault.fullPhotoHash, window._currentUser);
-          await api.request("/api/key-exchange", { method: "POST", body: JSON.stringify({ toUsername: addr.split("@")[0], encryptedPayload: keyPayload }) });
+          await api.request("/api/key-exchange", { method: "POST", body: JSON.stringify({ toUsername, encryptedPayload: keyPayload }) });
         } catch (err) { console.warn(`[photo-update] Key exchange failed for ${addr}:`, err); }
       }
     }
@@ -2016,24 +2110,68 @@ function SettingsView() {
       });
 
       api.token = res.token;
+
+      // Re-encrypt avatar with new feed key
+      if (vault.photoHash || vault.fullPhotoHash) {
+        setRotateStatus("Re-encrypting avatar...");
+        try {
+          if (vault.photoHash) {
+            const newHash = await reEncryptContent(vault.photoHash, identity.feedKey, newKeys.feedKey);
+            if (newHash) vault.photoHash = newHash;
+          }
+          if (vault.fullPhotoHash) {
+            const newHash = await reEncryptContent(vault.fullPhotoHash, identity.feedKey, newKeys.feedKey);
+            if (newHash) vault.fullPhotoHash = newHash;
+          }
+        } catch (err) { console.warn("[rotate] Avatar re-encryption failed:", err); }
+      }
+
       identity = newKeys;
 
       setRotateStatus("Sending new feed key to friends...");
       let sent = 0;
+      const failed = [];
+      // Deduplicate friends - avoid sending to both plaintext and hash entries for the same person
+      const sentToHashes = new Set();
       for (const addr of Object.keys(vault.friends || {})) {
-        const friendInfo = vault.friends[addr]; if (!friendInfo?.encPubKey) continue;
+        const friendInfo = vault.friends[addr];
+        const friendUser = addr.split("@")[0];
+        const friendHash = /^[a-f0-9]{64}$/.test(friendUser) ? friendUser : await hashUsername(friendUser);
+        if (sentToHashes.has(friendHash)) continue;
+        // Fetch encPubKey from server if missing in vault
+        let encPubKey = friendInfo?.encPubKey;
+        if (!encPubKey) {
+          try {
+            const profile = await api.request(`/api/profile/${friendHash}`);
+            if (profile.encryptionPublicKey) {
+              encPubKey = profile.encryptionPublicKey;
+              vault.friends[addr].encPubKey = encPubKey;
+            }
+          } catch {}
+        }
+        if (!encPubKey) { failed.push(addr); continue; }
         try {
-          const keyPayload = await encryptFeedKeyForFriend(newKeys.feedKeyB64, newKeys.encryption.privateKey, friendInfo.encPubKey, vault.displayName || null, vault.photoHash || null, vault.fullPhotoHash || null, window._currentUser);
-          await api.request("/api/key-exchange", { method: "POST", body: JSON.stringify({ toUsername: addr.split("@")[0], encryptedPayload: keyPayload }) });
+          const toUsername = friendHash;
+          const keyPayload = await encryptFeedKeyForFriend(newKeys.feedKeyB64, newKeys.encryption.privateKey, encPubKey, vault.displayName || null, vault.photoHash || null, vault.fullPhotoHash || null, window._currentUser);
+          await api.request("/api/key-exchange", { method: "POST", body: JSON.stringify({ toUsername, encryptedPayload: keyPayload }) });
+          sentToHashes.add(friendHash);
           sent++;
-        } catch (err) { console.warn(`[rotate] Key exchange failed for ${addr}:`, err); }
+        } catch (err) { console.warn(`[rotate] Key exchange failed for ${addr}:`, err); failed.push(addr); }
+      }
+
+      // Track friends who didn't receive the new key for retry on next login
+      if (failed.length > 0) {
+        vault.pendingKeyRotations = failed.map(addr => ({ addr, createdAt: Date.now() }));
+      } else {
+        delete vault.pendingKeyRotations;
       }
 
       await saveVault();
       try { await saveTrustedSession(currentUser, newKeys); } catch {}
 
       setRotateStatus(""); setShowRotate(false); setRotatePassword("");
-      alert(`Feed key rotated to version ${newFeedKeyVersion}. New key sent to ${sent} friend${sent !== 1 ? "s" : ""}. Old posts remain readable with the old key.`);
+      const failMsg = failed.length > 0 ? ` ${failed.length} friend${failed.length !== 1 ? "s" : ""} could not be reached and will be retried automatically.` : "";
+      alert(`Feed key rotated to version ${newFeedKeyVersion}. New key sent to ${sent} friend${sent !== 1 ? "s" : ""}.${failMsg} Old posts remain readable with the old key.`);
     } catch (err) {
       console.error("[rotate]", err);
       setRotateError(err.message || "Rotation failed");
@@ -2063,14 +2201,31 @@ function SettingsView() {
       const newVaultStr = await encryptVault(oldVault, newKeys.vaultKey);
       setPwStatus("Updating server...");
       const res = await api.request("/api/auth/change-password", { method: "POST", body: JSON.stringify({ newSigningPublicKey: newKeys.signingPublicKeyB64, newEncryptionPublicKey: newKeys.encryptionPublicKeyB64, newFingerprint: newKeys.fingerprint, newFeedKeyVersion, newVault: newVaultStr }) });
-      api.token = res.token; identity = newKeys; vault = oldVault;
+      api.token = res.token; vault = oldVault;
+      // Re-encrypt avatar with new feed key
+      if (vault.photoHash || vault.fullPhotoHash) {
+        setPwStatus("Re-encrypting avatar...");
+        try {
+          if (vault.photoHash) {
+            const newHash = await reEncryptContent(vault.photoHash, identity.feedKey, newKeys.feedKey);
+            if (newHash) vault.photoHash = newHash;
+          }
+          if (vault.fullPhotoHash) {
+            const newHash = await reEncryptContent(vault.fullPhotoHash, identity.feedKey, newKeys.feedKey);
+            if (newHash) vault.fullPhotoHash = newHash;
+          }
+        } catch (err) { console.warn("[pw-change] Avatar re-encryption failed:", err); }
+      }
+      identity = newKeys;
       setPwStatus("Sending new feed key to friends...");
       let sent = 0;
       for (const addr of Object.keys(vault.friends || {})) {
         const friendInfo = vault.friends[addr]; if (!friendInfo?.encPubKey) continue;
         try {
+          const friendUser = addr.split("@")[0];
+          const toUsername = /^[a-f0-9]{64}$/.test(friendUser) ? friendUser : await hashUsername(friendUser);
           const keyPayload = await encryptFeedKeyForFriend(newKeys.feedKeyB64, newKeys.encryption.privateKey, friendInfo.encPubKey, vault.displayName || null, vault.photoHash || null, vault.fullPhotoHash || null, window._currentUser);
-          await api.request("/api/key-exchange", { method: "POST", body: JSON.stringify({ toUsername: addr.split("@")[0], encryptedPayload: keyPayload }) });
+          await api.request("/api/key-exchange", { method: "POST", body: JSON.stringify({ toUsername, encryptedPayload: keyPayload }) });
           sent++;
         } catch (err) { console.warn(`[pw-change] Key exchange failed for ${addr}:`, err); }
       }
@@ -2270,7 +2425,7 @@ function AuthScreen({ onLogin }) {
         } catch (err) { console.warn("[migrate]", err); }
       }
       setLoadingText("Loading vault...");
-      await loadVault(); await buildVaultHashCache(); await processKeyExchanges(); await processFriendAccepted();
+      await loadVault(); await buildVaultHashCache(); await processKeyExchanges(); await processFriendAccepted(); await retryPendingKeyRotations();
       onLogin(username, trustDevice);
     } catch (err) { console.error("[auth]", err); setError("Login failed — wrong password or user not found."); }
     setLoading(false);
@@ -2460,7 +2615,7 @@ export default function App() {
             const migrateRes = await api.request("/api/migrate-identity", { method: "POST", body: JSON.stringify({ usernameHash: uHash }) });
             if (migrateRes.token) { api.token = migrateRes.token; await saveTrustedSession(session.username, session.keys); }
           } catch {}
-          await loadVault(); await buildVaultHashCache(); await processKeyExchanges(); await processFriendAccepted(); setLoggedIn(true);
+          await loadVault(); await buildVaultHashCache(); await processKeyExchanges(); await processFriendAccepted(); await retryPendingKeyRotations(); setLoggedIn(true);
         }
       } catch {}
       setRestoring(false);
@@ -2469,6 +2624,21 @@ export default function App() {
 
   const handleLogin = (u, trusted) => { setCurrentUser(u); window._currentUser = u; setLoggedIn(true); if (trusted) saveTrustedSession(u, identity); };
   const handleLogout = async () => { api.token = null; identity = null; vault = null; window._currentUser = null; avatarCache.clear(); await deviceStore.clear(); setLoggedIn(false); };
+
+  // Periodically process key exchanges while logged in
+  const [vaultVersion, setVaultVersion] = useState(0);
+  useEffect(() => {
+    if (!loggedIn) return;
+    const interval = setInterval(async () => {
+      try {
+        const updated = await processKeyExchanges();
+        await processFriendAccepted();
+        await retryPendingKeyRotations();
+        if (updated) setVaultVersion(v => v + 1);
+      } catch {}
+    }, 30000);
+    return () => clearInterval(interval);
+  }, [loggedIn]);
 
   if (restoring) return (
     <div style={{ minHeight: "100vh", background: T.bg, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" }}>
@@ -2480,7 +2650,7 @@ export default function App() {
 
   const views = { feed: <FeedView isMobile={isMobile} />, messages: <DMView isMobile={isMobile} />, friends: <FriendsView />, profile: <ProfileView isMobile={isMobile} />, settings: <SettingsView />, "user-profile": profileTarget ? <UserProfileView username={profileTarget.username} domain={profileTarget.domain} onBack={() => setView("feed")} /> : <FeedView isMobile={isMobile} /> };
   return (
-    <AppCtx.Provider value={{ currentUser, navigateToProfile }}>
+    <AppCtx.Provider value={{ currentUser, navigateToProfile, vaultVersion }}>
       <div style={{ minHeight: "100vh", background: T.bg, color: T.text, fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" }}>
         <Sidebar active={view} onNav={setView} onLogout={handleLogout} isMobile={isMobile} />
         <main style={{ marginLeft: isMobile ? 0 : 220, width: isMobile ? "100%" : "calc(100vw - 220px)", padding: isMobile ? "16px 12px" : "24px 15%", boxSizing: "border-box" }}>

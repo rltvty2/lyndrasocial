@@ -3,3 +3,6 @@ dist/
 data/
 *.db
 .env
+*.db
+.env
+.env.*
