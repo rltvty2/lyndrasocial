@@ -406,7 +406,7 @@ function PasswordStrengthMeter({ password }) {
 // Avatar photo cache
 // ============================================================================
 const avatarCache = new Map();
-const avatarLoading = new Set();
+const avatarLoading = new Map();
 
 async function reEncryptContent(hash, oldFeedKey, newFeedKey) {
   const res = await fetch(`/content/${hash}`);
@@ -428,35 +428,38 @@ async function reEncryptContent(hash, oldFeedKey, newFeedKey) {
 
 async function loadAvatar(username, domain) {
   const addr = `${username}@${domain}`;
-  if (avatarCache.has(addr) || avatarLoading.has(addr)) return avatarCache.get(addr) || null;
-  let photoHash = null; let feedKey = null;
-  if ((username === window._currentUser || username === identity?.usernameHash) && vault?.photoHash && identity) {
-    photoHash = vault.photoHash; feedKey = identity.feedKey;
-  } else {
-    let friendInfo = vault?.friends?.[addr];
-    if (!friendInfo?.photoHash) {
-      const merged = await findFriend(username);
-      if (merged) friendInfo = friendInfo ? { ...merged, ...friendInfo, photoHash: friendInfo.photoHash || merged.photoHash, fullPhotoHash: friendInfo.fullPhotoHash || merged.fullPhotoHash, feedKeyB64: friendInfo.feedKeyB64 || merged.feedKeyB64 } : merged;
+  if (avatarCache.has(addr)) return avatarCache.get(addr);
+  if (avatarLoading.has(addr)) return avatarLoading.get(addr);
+  const promise = (async () => {
+    let photoHash = null; let feedKey = null;
+    if ((username === window._currentUser || username === identity?.usernameHash) && vault?.photoHash && identity) {
+      photoHash = vault.photoHash; feedKey = identity.feedKey;
+    } else {
+      let friendInfo = vault?.friends?.[addr];
+      if (!friendInfo?.photoHash) {
+        const merged = await findFriend(username);
+        if (merged) friendInfo = friendInfo ? { ...merged, ...friendInfo, photoHash: friendInfo.photoHash || merged.photoHash, fullPhotoHash: friendInfo.fullPhotoHash || merged.fullPhotoHash, feedKeyB64: friendInfo.feedKeyB64 || merged.feedKeyB64 } : merged;
+      }
+      if (friendInfo?.photoHash && friendInfo?.feedKeyB64) {
+        photoHash = friendInfo.photoHash;
+        try { feedKey = await importFeedKeyFromB64(friendInfo.feedKeyB64); } catch { return null; }
+      }
     }
-    if (friendInfo?.photoHash && friendInfo?.feedKeyB64) {
-      photoHash = friendInfo.photoHash;
-      try { feedKey = await importFeedKeyFromB64(friendInfo.feedKeyB64); } catch { return null; }
-    }
-  }
-  if (!photoHash || !feedKey) return null;
-  avatarLoading.add(addr);
-  try {
-    const res = await fetch(`/content/${photoHash}`);
-    if (!res.ok) return null;
-    const encrypted = new Uint8Array(await res.arrayBuffer());
-    const iv = encrypted.slice(0, 12); const ct = encrypted.slice(12);
-    const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, feedKey, ct);
-    const blob = new Blob([plain], { type: "image/jpeg" });
-    const url = URL.createObjectURL(blob);
-    avatarCache.set(addr, url);
-    return url;
-  } catch (err) { console.warn("[avatar] Load failed:", err); return null; }
-  finally { avatarLoading.delete(addr); }
+    if (!photoHash || !feedKey) return null;
+    try {
+      const res = await fetch(`/content/${photoHash}`);
+      if (!res.ok) return null;
+      const encrypted = new Uint8Array(await res.arrayBuffer());
+      const iv = encrypted.slice(0, 12); const ct = encrypted.slice(12);
+      const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, feedKey, ct);
+      const blob = new Blob([plain], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
+      avatarCache.set(addr, url);
+      return url;
+    } catch (err) { console.warn("[avatar] Load failed:", err); return null; }
+  })();
+  avatarLoading.set(addr, promise);
+  try { return await promise; } finally { avatarLoading.delete(addr); }
 }
 
 async function uploadAvatar(thumbBlob, originalFile, feedKey) {
@@ -2436,7 +2439,7 @@ function AuthScreen({ onLogin }) {
   return (
     <div style={{ minHeight: "100vh", background: T.bg, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" }}>
       <div style={{ maxWidth: 440, width: "100%", textAlign: "center" }}>
-        <h1 style={{ color: T.text, fontSize: 32, marginBottom: 4 }}><span style={{ color: T.accent }}>libre</span>social</h1>
+        <h1 style={{ color: T.text, fontSize: 32, marginBottom: 4 }}><span style={{ color: T.accent }}>libera</span>social</h1>
         <p style={{ color: T.textMuted, marginBottom: 32, fontSize: 15, lineHeight: 1.6 }}>Decentralized. Encrypted. No algorithm.</p>
         <div style={{ background: T.bgCard, borderRadius: 16, padding: 28, border: `1px solid ${T.border}`, textAlign: "left" }}>
           <div style={{ display: "flex", marginBottom: 20, background: T.bgHover, borderRadius: 8, padding: 3 }}>
@@ -2520,7 +2523,7 @@ function Sidebar({ active, onNav, onLogout, isMobile }) {
     return (
       <>
         <div style={{ position: "sticky", top: 0, zIndex: 100, background: T.bgCard, borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 16px" }}>
-          <h2 style={{ margin: 0, fontSize: 18, color: T.text }}><span style={{ color: T.accent }}>libre</span>social</h2>
+          <h2 style={{ margin: 0, fontSize: 18, color: T.text }}><span style={{ color: T.accent }}>libera</span>social</h2>
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
             <span style={{ color: T.textMuted, fontSize: 13 }}>{NAV.find(n => n.id === active)?.icon} {NAV.find(n => n.id === active)?.label}</span>
             <button onClick={() => setMenuOpen(!menuOpen)} style={{ background: "none", border: "none", color: T.text, fontSize: 24, cursor: "pointer", padding: "2px 4px", lineHeight: 1 }}>{menuOpen ? "✕" : "☰"}</button>
@@ -2531,7 +2534,7 @@ function Sidebar({ active, onNav, onLogout, isMobile }) {
             <div onClick={() => setMenuOpen(false)} style={{ position: "fixed", top: 0, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.5)", zIndex: 199 }} />
             <div style={{ position: "fixed", top: 0, right: 0, width: "min(280px, 80vw)", height: "100vh", background: T.bgCard, zIndex: 200, display: "flex", flexDirection: "column", boxShadow: "-4px 0 20px rgba(0,0,0,0.4)" }}>
               <div style={{ padding: "16px", borderBottom: `1px solid ${T.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-                <h2 style={{ margin: 0, fontSize: 18, color: T.text }}><span style={{ color: T.accent }}>libre</span>social</h2>
+                <h2 style={{ margin: 0, fontSize: 18, color: T.text }}><span style={{ color: T.accent }}>libera</span>social</h2>
                 <button onClick={() => setMenuOpen(false)} style={{ background: "none", border: "none", color: T.textMuted, fontSize: 22, cursor: "pointer", padding: "2px 6px" }}>✕</button>
               </div>
               <nav style={{ flex: 1, padding: "8px 8px", overflowY: "auto" }}>
@@ -2558,7 +2561,7 @@ function Sidebar({ active, onNav, onLogout, isMobile }) {
 
   return (
     <div style={{ width: 220, background: T.bgCard, borderRight: `1px solid ${T.border}`, display: "flex", flexDirection: "column", flexShrink: 0, height: "100vh", position: "fixed", top: 0, left: 0, zIndex: 100 }}>
-      <div style={{ padding: "20px 16px 12px" }}><h2 style={{ margin: 0, fontSize: 18, color: T.text }}><span style={{ color: T.accent }}>libre</span>social</h2><div style={{ color: T.textDim, fontSize: 11, marginTop: 2 }}>Encrypted · Federated</div></div>
+      <div style={{ padding: "20px 16px 12px" }}><h2 style={{ margin: 0, fontSize: 18, color: T.text }}><span style={{ color: T.accent }}>libera</span>social</h2><div style={{ color: T.textDim, fontSize: 11, marginTop: 2 }}>Encrypted · Federated</div></div>
       <nav style={{ flex: 1, padding: "8px 8px" }}>
         {NAV.map(n => (
           <button key={n.id} onClick={() => onNav(n.id)} style={{ display: "flex", alignItems: "center", gap: 12, width: "100%", padding: "10px 12px", border: "none", borderRadius: 8, cursor: "pointer", background: active === n.id ? T.accentDim : "transparent", color: active === n.id ? T.accent : T.textMuted, fontSize: 14, fontWeight: active === n.id ? 600 : 400, textAlign: "left", marginBottom: 2 }}>
@@ -2642,7 +2645,7 @@ export default function App() {
 
   if (restoring) return (
     <div style={{ minHeight: "100vh", background: T.bg, display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" }}>
-      <div style={{ textAlign: "center" }}><h1 style={{ color: T.text, fontSize: 24, marginBottom: 8 }}><span style={{ color: T.accent }}>libre</span>social</h1><div style={{ color: T.textDim, fontSize: 14 }}>Restoring session...</div></div>
+      <div style={{ textAlign: "center" }}><h1 style={{ color: T.text, fontSize: 24, marginBottom: 8 }}><span style={{ color: T.accent }}>libera</span>social</h1><div style={{ color: T.textDim, fontSize: 14 }}>Restoring session...</div></div>
     </div>
   );
 
