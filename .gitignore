@@ -3,12 +3,4 @@ dist/
 data/
 *.db
 .env
-*.db
-.env
-.env.*
-*.db
-.env
-.env.*
-*.db
-.env
 .env.*
