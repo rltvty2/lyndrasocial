@@ -587,6 +587,11 @@ export class UserStore {
     this.db.prepare('UPDATE group_chats SET updated_at = ? WHERE id = ?').run(now, groupId)
   }
 
+  async removeGroupMember(groupId, username) {
+    this.db.prepare('DELETE FROM group_members WHERE group_id = ? AND username = ?').run(groupId, username)
+    this.db.prepare('UPDATE group_chats SET updated_at = ? WHERE id = ?').run(Date.now(), groupId)
+  }
+
   async addGroupMessage(id, groupId, fromUser, encryptedContent, iv) {
     const now = Date.now()
     this.db.prepare('INSERT INTO group_messages (id, group_id, from_user, encrypted_content, iv, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(id, groupId, fromUser, encryptedContent, iv, now)
